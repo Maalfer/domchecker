@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import asyncio
 import aiohttp
@@ -9,10 +8,28 @@ import sys
 import os
 from typing import Tuple, Optional
 
-BANNER = r"""\
-┌───────────────────────────────────────────────┐
-│   Subdomain Live Checker (estricto, async)   │
-└───────────────────────────────────────────────┘
+try:
+    from colorama import init as colorama_init, Fore, Style
+    colorama_init(autoreset=True)
+    YELLOW = Style.BRIGHT + Fore.YELLOW
+    RESET = Style.RESET_ALL
+except Exception:
+    YELLOW = "\033[93;1m"
+    RESET = "\033[0m"
+
+BANNER = f"""
+
+8888888b.                          .d8888b.  888                        888
+888  "Y88b                        d88P  Y88b 888                        888
+888    888                        888    888 888                        888
+888    888  .d88b.  88888b.d88b.  888        88888b.   .d88b.   .d8888b 888  888  .d88b.  888d888
+888    888 d88""88b 888 "888 "88b 888        888 "88b d8P  Y8b d88P"    888 .88P d8P  Y8b 888P"
+888    888 888  888 888  888  888 888    888 888  888 88888888 888      888888K  88888888 888
+888  .d88P Y88..88P 888  888  888 Y88b  d88P 888  888 Y8b.     Y88b.    888 "88b Y8b.     888
+8888888P"   "Y88P"  888  888  888  "Y8888P"  888  888  "Y8888   "Y8888P 888  888  "Y8888  888
+
+
+{YELLOW}By 'El Pingüino de Mario'{RESET}
 """
 
 async def get_with_ttfb(session: aiohttp.ClientSession, url: str,
@@ -80,8 +97,7 @@ class UI:
     def update_progress(self):
         if self.use_ansi:
             up = self.printed_domains + 1
-            sys.stdout.write(f"\x1b[{up}A\r{self._progress_str()}\x1b[K")
-            sys.stdout.write(f"\x1b[{up}B")
+            sys.stdout.write(f"\x1b[{up}A\r{self._progress_str()}\x1b[K\x1b[{up}B\r")
             sys.stdout.flush()
         else:
             sys.stdout.write("\r" + self._progress_str())
