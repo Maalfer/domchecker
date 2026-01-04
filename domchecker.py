@@ -32,46 +32,69 @@ BANNER = f"""
 {YELLOW}By 'El Pingüino de Mario'{RESET}
 """
 
-async def get_with_ttfb(session: aiohttp.ClientSession, url: str,
-                        ttfb_timeout: float, read_min_bytes: int,
-                        total_timeout: float) -> Tuple[int, float, float]:
+async def get_with_ttfb(
+    session: aiohttp.ClientSession,
+    url: str,
+    connect_timeout: float,
+    first_byte_timeout: float,
+    read_min_bytes: int,
+    total_timeout: float
+) -> Tuple[int, float, float]:
+    """
+    Realiza una petición GET midiendo:
+    - Tiempo hasta headers (TTFB estricto)
+    - Tiempo hasta primer byte del cuerpo (más permisivo)
+    """
     timeout = aiohttp.ClientTimeout(
         total=total_timeout,
-        sock_connect=ttfb_timeout,
-        sock_read=ttfb_timeout
+        connect=connect_timeout,        # conexión + headers
+        sock_read=first_byte_timeout    # tiempo máximo para primer byte del cuerpo
     )
     start = time.perf_counter()
     async with session.get(url, timeout=timeout, allow_redirects=True, max_redirects=5) as resp:
         elapsed_headers = time.perf_counter() - start
         if resp.status == 204:
             return resp.status, round(elapsed_headers, 3), 0.0
+
         want = read_min_bytes
         got = 0
         first_byte_elapsed: Optional[float] = None
+
         while got < want:
             try:
                 chunk = await asyncio.wait_for(
                     resp.content.read(min(8192, want - got)),
-                    timeout=ttfb_timeout
+                    timeout=first_byte_timeout  # mismo timeout permisivo para lectura
                 )
             except asyncio.TimeoutError:
-                raise asyncio.TimeoutError("TTFB/body timeout")
+                raise asyncio.TimeoutError("Timeout esperando cuerpo")
             if not chunk:
                 break
             if first_byte_elapsed is None:
                 first_byte_elapsed = time.perf_counter() - start
             got += len(chunk)
+
         if first_byte_elapsed is None and want > 0:
-            raise asyncio.TimeoutError("No se recibió ningún byte de cuerpo a tiempo")
+            raise asyncio.TimeoutError("No se recibió ningún byte del cuerpo a tiempo")
+
         return resp.status, round(elapsed_headers, 3), round(first_byte_elapsed or 0.0, 3)
 
-async def probe(domain: str, session: aiohttp.ClientSession,
-                ttfb_timeout: float, read_min_bytes: int, total_timeout: float):
+async def probe(
+    domain: str,
+    session: aiohttp.ClientSession,
+    connect_timeout: float,
+    first_byte_timeout: float,
+    read_min_bytes: int,
+    total_timeout: float
+):
     schemes = ['https://', 'http://']
     for scheme in schemes:
         url = scheme + domain
         try:
-            status, _, _ = await get_with_ttfb(session, url, ttfb_timeout, read_min_bytes, total_timeout)
+            status, _, _ = await get_with_ttfb(
+                session, url, connect_timeout, first_byte_timeout,
+                read_min_bytes, total_timeout
+            )
             alive = 200 <= status < 300
             return domain, alive
         except Exception:
@@ -108,11 +131,20 @@ class UI:
         sys.stdout.flush()
         self.printed_domains += 1
 
-async def worker(name: int, queue: asyncio.Queue, session: aiohttp.ClientSession,
-                 ttfb_timeout: float, read_min_bytes: int, total_timeout: float,
-                 per_request_delay: float,
-                 counters: dict, activos_list: list, ui: UI,
-                 stop_event: asyncio.Event):
+async def worker(
+    name: int,
+    queue: asyncio.Queue,
+    session: aiohttp.ClientSession,
+    connect_timeout: float,
+    first_byte_timeout: float,
+    read_min_bytes: int,
+    total_timeout: float,
+    per_request_delay: float,
+    counters: dict,
+    activos_list: list,
+    ui: UI,
+    stop_event: asyncio.Event
+):
     while True:
         if stop_event.is_set():
             return
@@ -126,7 +158,10 @@ async def worker(name: int, queue: asyncio.Queue, session: aiohttp.ClientSession
             if stop_event.is_set():
                 queue.put_nowait(domain)
                 return
-            dom, alive = await probe(domain, session, ttfb_timeout, read_min_bytes, total_timeout)
+            dom, alive = await probe(
+                domain, session, connect_timeout, first_byte_timeout,
+                read_min_bytes, total_timeout
+            )
             counters['done'] += 1
             ui.done = counters['done']
             if alive:
@@ -148,9 +183,17 @@ def drain_queue(q: asyncio.Queue):
     except asyncio.QueueEmpty:
         pass
 
-async def main_async(domains_file: str, concurrency: int, rps: float,
-                     ttfb_timeout: float, read_min_bytes: int, total_timeout: float,
-                     ipv4_only: bool, force_no_ansi: bool) -> int:
+async def main_async(
+    domains_file: str,
+    concurrency: int,
+    rps: float,
+    connect_timeout: float,
+    first_byte_timeout: float,
+    read_min_bytes: int,
+    total_timeout: float,
+    ipv4_only: bool,
+    force_no_ansi: bool
+) -> int:
     print(BANNER)
     with open(domains_file, 'r', encoding='utf-8') as f:
         raw = [line.strip() for line in f]
@@ -160,9 +203,13 @@ async def main_async(domains_file: str, concurrency: int, rps: float,
     total = len(dominios)
     if total == 0:
         return 0
-    per_request_delay = 0.0
+
+    # Corrección del cálculo de RPS
     if rps > 0:
-        per_request_delay = max(0.0, concurrency / rps)
+        per_request_delay = 1.0 / rps
+    else:
+        per_request_delay = 0.0
+
     connector_kwargs = {
         "limit": max(concurrency, 20),
         "limit_per_host": max(5, min(10, concurrency)),
@@ -190,8 +237,8 @@ async def main_async(domains_file: str, concurrency: int, rps: float,
             queue.put_nowait(d)
         tasks = [
             asyncio.create_task(
-                worker(i, queue, session, ttfb_timeout, read_min_bytes,
-                       total_timeout, per_request_delay,
+                worker(i, queue, session, connect_timeout, first_byte_timeout,
+                       read_min_bytes, total_timeout, per_request_delay,
                        counters, activos_list, ui, stop_event),
                 name=f"worker-{i}"
             )
@@ -217,9 +264,12 @@ def main():
     parser.add_argument('domains_file', type=str)
     parser.add_argument('--concurrency', type=int, default=50)
     parser.add_argument('--rps', type=float, default=20.0)
-    parser.add_argument('--ttfb-timeout', type=float, default=3.0)
+    parser.add_argument('--connect-timeout', type=float, default=3.0,
+                        help='Timeout para conexión + headers (TTFB estricto)')
+    parser.add_argument('--first-byte-timeout', type=float, default=8.0,
+                        help='Timeout para primer byte del cuerpo (más permisivo)')
     parser.add_argument('--read-min-bytes', type=int, default=64)
-    parser.add_argument('--total-timeout', type=float, default=8.0)
+    parser.add_argument('--total-timeout', type=float, default=15.0)
     parser.add_argument('--ipv4-only', action='store_true')
     parser.add_argument('--no-ansi', action='store_true')
     args = parser.parse_args()
@@ -227,7 +277,8 @@ def main():
     try:
         exit_code = asyncio.run(main_async(
             args.domains_file, args.concurrency, args.rps,
-            args.ttfb_timeout, args.read_min_bytes, args.total_timeout,
+            args.connect_timeout, args.first_byte_timeout,
+            args.read_min_bytes, args.total_timeout,
             args.ipv4_only, args.no_ansi
         ))
     except KeyboardInterrupt:
